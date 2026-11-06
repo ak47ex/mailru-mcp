@@ -37,6 +37,7 @@ D = "{DAV:}"
 C = "{urn:ietf:params:xml:ns:caldav}"
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 MAX_DAYS = 62
+MAX_ATTENDEES = 20
 
 # Имена поясов Windows (приглашения из Outlook) -> IANA
 WIN_TZ = {
@@ -141,6 +142,7 @@ def _href_in(root: ET.Element, prop: str) -> Optional[str]:
 
 
 _calendars_cache: Optional[list[dict]] = None
+_outbox_cache: Optional[str] = None
 
 
 def calendars(refresh: bool = False) -> list[dict]:
@@ -720,6 +722,225 @@ def _http(method: str, url: str, body: Optional[str] = None,
         raise RuntimeError(f"CalDAV {method} {url}: {e.reason}") from None
     except (http.client.HTTPException, OSError) as e:
         raise RuntimeError(f"CalDAV {method} {url}: {e!r}") from None
+
+
+# ---------- занятость участников (free-busy, RFC 6638) ----------
+
+_ADDR_RE = re.compile(r"^[^@\s,<>]+@[^@\s,<>]+$")
+_FB_TIME = "%Y%m%dT%H%M%SZ"
+
+
+def _post(url: str, body: str, headers: dict) -> bytes:
+    """POST с Basic-авторизацией, возвращает тело ответа."""
+    if not USER or not PASSWORD:
+        raise RuntimeError("Не заданы MAILRU_USER / MAILRU_APP_PASSWORD")
+    token = base64.b64encode(f"{USER}:{PASSWORD}".encode("utf-8")).decode()
+    hdrs = {"Authorization": "Basic " + token, "User-Agent": "mailru-mcp/1.0"}
+    hdrs.update(headers)
+    req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST", headers=hdrs)
+    try:
+        with _opener.open(req, timeout=30) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise RuntimeError("CalDAV 401: пароль приложения не принят для календаря.") from None
+        if e.code == 403:
+            raise RuntimeError(
+                "CalDAV 403: запрос занятости участников запрещён "
+                "(возможно, закрыт администратором домена).") from None
+        try:
+            detail = e.read()[:300].decode("utf-8", "replace").strip()
+        except Exception:
+            detail = ""
+        raise RuntimeError(
+            f"CalDAV POST {url}: HTTP {e.code} {e.reason}. {detail}".strip()) from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"CalDAV POST {url}: {e.reason}") from None
+    except (http.client.HTTPException, OSError) as e:
+        raise RuntimeError(f"CalDAV POST {url}: {e!r}") from None
+
+
+def _outbox_url() -> str:
+    """URL schedule-outbox пользователя (кешируется)."""
+    global _outbox_cache
+    if _outbox_cache:
+        return _outbox_cache
+    prop = "<C:schedule-outbox-URL/>"
+    final, root = _propfind(BASE_URL + "/", prop)
+    href = _href_in(root, f"{C}schedule-outbox-URL")
+    if not href:
+        # BASE_URL указывает не на principal: находим principal и спрашиваем у него
+        final, root = _propfind(BASE_URL + "/", "<D:current-user-principal/>")
+        principal = _href_in(root, f"{D}current-user-principal")
+        if principal:
+            final, root = _propfind(urljoin(final, principal), prop)
+            href = _href_in(root, f"{C}schedule-outbox-URL")
+    if not href:
+        raise RuntimeError("CalDAV: сервер не отдал schedule-outbox-URL "
+                           "(занятость участников недоступна)")
+    _outbox_cache = urljoin(final, href)
+    return _outbox_cache
+
+
+def _norm_addr(a: str) -> str:
+    a = a.strip().lower()
+    return a[7:].strip() if a.startswith("mailto:") else a
+
+
+def build_freebusy_request(attendees: list[str], start_utc: datetime, end_utc: datetime,
+                           uid: str, now_utc: datetime) -> str:
+    """iTIP-запрос VFREEBUSY (METHOD:REQUEST) на период [start_utc, end_utc]."""
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//mailru-mcp//freebusy//EN",
+             "METHOD:REQUEST", "BEGIN:VFREEBUSY",
+             f"UID:{uid}",
+             "DTSTAMP:" + now_utc.strftime(_FB_TIME),
+             "DTSTART:" + start_utc.strftime(_FB_TIME),
+             "DTEND:" + end_utc.strftime(_FB_TIME),
+             f"ORGANIZER:mailto:{USER}"]
+    lines += [f"ATTENDEE:mailto:{a}" for a in attendees]
+    lines += ["END:VFREEBUSY", "END:VCALENDAR"]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _parse_fb_time(v: str) -> datetime:
+    return datetime.strptime(v.strip(), _FB_TIME).replace(tzinfo=timezone.utc)
+
+
+def _parse_vfreebusy(ics: str) -> tuple[list[tuple[datetime, datetime, str]], int]:
+    """Занятые периоды из FREEBUSY -> ([(начало, конец, BUSY|BUSY-TENTATIVE|BUSY-UNAVAILABLE)], число
+    неразобранных периодов). FBTYPE=FREE пропускается, без FBTYPE - BUSY."""
+    out, bad = [], 0
+    for line in _unfold(ics):
+        head, sep, value = line.partition(":")
+        if not sep:
+            continue
+        name, *params = head.split(";")
+        if name.strip().upper() != "FREEBUSY":
+            continue
+        fbtype = "BUSY"
+        for p in params:
+            k, _, v = p.partition("=")
+            if k.strip().upper() == "FBTYPE":
+                fbtype = v.strip().strip('"').upper() or "BUSY"
+        if fbtype == "FREE":
+            continue
+        if fbtype not in ("BUSY-TENTATIVE", "BUSY-UNAVAILABLE"):
+            fbtype = "BUSY"
+        for period in value.split(","):
+            if not period.strip():
+                continue
+            a, _, b = period.partition("/")
+            try:
+                start = _parse_fb_time(a)
+                if b.strip().upper().startswith(("P", "+P", "-P")):
+                    td = _duration(b)
+                    if td <= timedelta(0):
+                        raise ValueError(b)
+                    end = start + td
+                else:
+                    end = _parse_fb_time(b)
+            except ValueError:
+                bad += 1
+                continue
+            out.append((start, end, fbtype))
+    return out, bad
+
+
+def parse_schedule_response(xml_text) -> dict[str, dict]:
+    """C:schedule-response -> {адрес: {"busy": [(начало, конец, тип)], "status", "error"}}."""
+    raw = xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        raise RuntimeError(f"CalDAV: ответ занятости не XML: {raw[:200]!r}") from None
+    res: dict[str, dict] = {}
+    for resp in root.iter(f"{C}response"):
+        addr = _norm_addr(resp.findtext(f"{C}recipient/{D}href") or "")
+        if not addr:
+            continue
+        status = (resp.findtext(f"{C}request-status") or "").strip()
+        item = {"busy": [], "status": status, "error": None}
+        res[addr] = item
+        if not status.startswith("2."):
+            item["error"] = status or "нет request-status"
+            continue
+        data = resp.findtext(f"{C}calendar-data")
+        if not data or not data.strip():
+            item["error"] = "пустой ответ"
+            continue
+        item["busy"], bad = _parse_vfreebusy(data)
+        if bad:
+            item["error"] = "не удалось разобрать FREEBUSY"
+    return res
+
+
+def freebusy(attendees: list[str], ws: datetime, we: datetime) -> dict[str, dict]:
+    """Занятость участников за [ws, we] через schedule-outbox.
+
+    Мусорный адрес не роняет остальных: для него {"busy": [], "error": "некорректный адрес"}.
+    ValueError только при превышении MAX_ATTENDEES."""
+    seen: list[str] = []
+    for a in attendees:
+        a = _norm_addr(a)
+        if a not in seen:
+            seen.append(a)
+    if len(seen) > MAX_ATTENDEES:
+        raise ValueError(f"Участников не больше {MAX_ATTENDEES}")
+    valid = [a for a in seen if _ADDR_RE.match(a)]
+    results: dict[str, dict] = {}
+    parsed: dict[str, dict] = {}
+    if valid:
+        now = datetime.now(timezone.utc)
+        body = build_freebusy_request(valid, ws.astimezone(timezone.utc),
+                                      we.astimezone(timezone.utc), f"freebusy-{uuid.uuid4()}", now)
+        raw = _post(_outbox_url(), body, {
+            "Content-Type": "text/calendar; charset=utf-8",
+            "Originator": f"mailto:{USER}",
+            "Recipient": ", ".join(f"mailto:{a}" for a in valid),
+        })
+        parsed = parse_schedule_response(raw)
+    for a in seen:
+        if not _ADDR_RE.match(a):
+            results[a] = {"busy": [], "status": "", "error": "некорректный адрес"}
+        elif a in parsed:
+            results[a] = parsed[a]
+        else:
+            results[a] = {"busy": [], "status": "", "error": "нет ответа сервера по адресу"}
+    return results
+
+
+def merge_attendee_busy(results: dict[str, dict], ws: datetime, we: datetime,
+                        tentative_is_busy: bool
+                        ) -> tuple[list[tuple[datetime, datetime]], list[dict]]:
+    """Результат freebusy -> (занятые интервалы для расчёта слотов, сведения по участникам).
+
+    BUSY и BUSY-UNAVAILABLE занимают время всегда, BUSY-TENTATIVE - только при
+    tentative_is_busy. Интервалы режутся по [ws, we]. Участник без занятого интервала в окне
+    получает warning: Mail.ru на неверный адрес отвечает «свободен весь период»."""
+    busy: list[tuple[datetime, datetime]] = []
+    info: list[dict] = []
+    for addr, r in results.items():
+        n_busy = n_tent = 0
+        for s, e, t in r.get("busy") or []:
+            s, e = max(s, ws), min(e, we)
+            if e <= s:
+                continue
+            tentative = t == "BUSY-TENTATIVE"
+            if tentative:
+                n_tent += 1
+            else:
+                n_busy += 1
+            if tentative and not tentative_is_busy:
+                continue
+            busy.append((s.astimezone(ws.tzinfo), e.astimezone(ws.tzinfo)))
+        row = {"address": addr, "busy_found": bool(n_busy or n_tent),
+               "busy_intervals": n_busy, "tentative_intervals": n_tent}
+        if r.get("error"):
+            row["error"] = r["error"]
+        elif not row["busy_found"]:
+            row["warning"] = "занятость не найдена, возможно адрес неверный"
+        info.append(row)
+    return busy, info
 
 
 # ---------- текст iCalendar построчно (неизвестные свойства сохраняются как есть) ----------

@@ -833,6 +833,7 @@ def calendar_free_slots(
     extra_busy: Optional[list[dict]] = None,
     tentative_is_busy: bool = True,
     all_day_blocks: bool = False,
+    attendees: Optional[list[str]] = None,
 ) -> dict:
     """Свободные слоты и встречи по дням в рабочие часы по календарю Mail.ru.
 
@@ -843,6 +844,15 @@ def calendar_free_slots(
     tentative_is_busy — считать ли занятыми встречи «под вопросом».
     all_day_blocks — блокируют ли день события на весь день (по умолчанию только упоминаются).
     Отклонённые, отменённые и помеченные «свободен» встречи время не занимают.
+    attendees — почтовые адреса участников (list[str], до 20); их занятость (free-busy сервера
+    Mail.ru) учитывается вместе с вашими встречами, слоты — общие свободные. В ответе attendees:
+    по каждому адресу busy_found / warning / error. ОБЯЗАТЕЛЬНО скажите пользователю про каждого
+    участника с warning («занятость не найдена, возможно адрес неверный»: Mail.ru на неверный адрес
+    отвечает «свободен весь период») и про error (занятость этого участника не учтена или учтена
+    не полностью), не считайте их достоверно свободными; предложите проверить адрес.
+    Если в ответе есть attendees_error — занятость участников НЕ учтена вообще, слоты показывают
+    только вашу занятость (attendees при этом пустой, это не значит «все свободны»). ОБЯЗАТЕЛЬНО
+    сообщите пользователю текст ошибки.
     """
     d1, d2, ws, we = cal._window(date_from, date_to)
     events, errors = cal.fetch(date_from, date_to, calendars)
@@ -878,6 +888,14 @@ def calendar_free_slots(
         busy.append((s, en))
         note(s.date(), {"start": s.strftime("%H:%M"), "end": en.strftime("%H:%M"),
                         "summary": item.get("summary") or "(занято)", "source": "extra"})
+    att_info, att_error = [], None
+    if attendees:
+        try:
+            res = cal.freebusy(attendees, ws, we)
+            busy_att, att_info = cal.merge_attendee_busy(res, ws, we, tentative_is_busy)
+            busy.extend(busy_att)
+        except (RuntimeError, ValueError) as e:
+            att_error = str(e)
 
     days = cal.free_slots(busy, d1, d2, day_start, day_end, min_minutes,
                           weekdays_only, blocked_days=blocked)
@@ -886,6 +904,10 @@ def calendar_free_slots(
         day["meetings"] = sorted(rows, key=lambda r: r.get("start", ""))
     out = {"timezone": cal.TZ_NAME, "work_hours": f"{day_start}-{day_end}",
            "min_minutes": min_minutes, "days": days}
+    if attendees:
+        out["attendees"] = att_info
+        if att_error:
+            out["attendees_error"] = att_error
     if errors:
         out["errors"] = errors
     return out
